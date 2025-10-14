@@ -2,6 +2,7 @@ import pandas as pd  # type: ignore[import]
 import numpy as np  # type: ignore[import]
 from typing import Final
 from .wyckoff_types import WyckoffSign, Timeframe
+from .adaptive_thresholds import AdaptiveThresholdManager
 
 # Constants for Wyckoff sign detection
 STRONG_DEV_THRESHOLD: Final[float] = 2.1
@@ -22,23 +23,32 @@ def detect_wyckoff_signs(
     if len(df) < 5:
         return WyckoffSign.NONE
 
+    # Get adaptive thresholds based on historical percentiles
+    adaptive_thresholds = AdaptiveThresholdManager.get_wyckoff_sign_thresholds(df, timeframe)
+    min_price_move = adaptive_thresholds["min_price_move"]
+    min_volume_surge = adaptive_thresholds["min_volume_surge"]
+    price_p75 = adaptive_thresholds["price_percentile_75"]
+    price_p90 = adaptive_thresholds["price_percentile_90"]
+    volume_p75 = adaptive_thresholds["volume_percentile_75"]
+    volume_p90 = adaptive_thresholds["volume_percentile_90"]
+
     # Calculate key metrics with noise reduction
     price_change = df['c'].pct_change()
     volume_change = df['v'].pct_change()
-    
+
     # Use timeframe-specific lookback periods from settings
     volatility_window = max(5, timeframe.settings.spring_upthrust_window)
     volume_ma_window = max(5, timeframe.settings.volume_ma_window // 3)
     price_ma_window = max(8, int(timeframe.settings.ema_length * 0.75))
-    
+
     # Use timeframe settings for recent high/low lookback
     recent_window = timeframe.settings.swing_lookback
-    
+
     # Calculate rolling metrics with adaptive windows
     price_volatility = df['c'].pct_change().rolling(volatility_window).std().iloc[-1]
     volume_ma = df['v'].rolling(volume_ma_window).mean()
     price_ma = df['c'].rolling(price_ma_window).mean()
-    
+
     # Use dedicated Wyckoff sign detection parameters from settings
     volatility_factor = timeframe.settings.wyckoff_volatility_factor
     trend_lookback = timeframe.settings.wyckoff_trend_lookback
@@ -49,11 +59,6 @@ def detect_wyckoff_signs(
     sc_multiplier = timeframe.settings.wyckoff_sc_multiplier
     ar_multiplier = timeframe.settings.wyckoff_ar_multiplier
     confirmation_threshold = timeframe.settings.wyckoff_confirmation_threshold
-
-    # Use dynamic thresholds based on market volatility
-    # Increase minimum thresholds by 25% to be more conservative
-    min_price_move = max(0.004, price_volatility * 1.75 * volatility_factor)  
-    min_volume_surge = max(2.0, volume_change.rolling(volatility_window).std().iloc[-1] * 2.5 * volatility_factor)
     
     # Detect market context for better signal relevance
     is_high_volatility = price_volatility > df['c'].pct_change().rolling(volatility_window * 3).std().mean() * 1.5
@@ -108,14 +113,17 @@ def detect_wyckoff_signs(
     # Implement sign detection overlap prevention
     # Only return the strongest sign when multiple conditions are met
     sign_scores = {}
-    
-    # Selling Climax (SC) - more stringent conditions
-    if (price_change.iloc[-1] < -min_price_move * sc_multiplier * 1.2 and
-        volume_change.iloc[-1] > min_volume_surge * 1.3 and
+
+    # Selling Climax (SC) - use percentile thresholds for extreme moves
+    if (abs(price_change.iloc[-1]) > price_p90 and  # Top 10% price moves
+            price_change.iloc[-1] < 0 and
+            (df['v'].iloc[-1] / volume_ma.iloc[-1]) > volume_p90 and  # Top 10% volume
         price_strength < -STRONG_DEV_THRESHOLD * 0.9 and
         price_distance_from_ma < -0.04 and
         confirm_volume(3, min_volume_surge * 0.8)):
-        sign_scores[WyckoffSign.SELLING_CLIMAX] = abs(price_change.iloc[-1]) * volume_change.iloc[-1]
+        # Stronger score for higher percentile moves
+        percentile_strength = abs(price_change.iloc[-1]) / price_p90
+        sign_scores[WyckoffSign.SELLING_CLIMAX] = percentile_strength * (df['v'].iloc[-1] / volume_ma.iloc[-1])
         
     # Automatic Rally (AR) - more stringent conditions
     if (price_change.iloc[-1] > min_price_move * ar_multiplier * 1.2 and
@@ -144,22 +152,26 @@ def detect_wyckoff_signs(
         price_strength < STRONG_DEV_THRESHOLD * 0.4 and
         confirm_trend(3, min_price_move * 0.6)):
         sign_scores[WyckoffSign.LAST_POINT_OF_SUPPORT] = price_change.iloc[-1] * volume_trend
-        
-    # Sign of Strength (SOS)
-    if (price_change.iloc[-1] > min_price_move * sos_multiplier * 1.2 and
-        confirm_trend(3, min_price_move * 0.8) and
-        volume_change.iloc[-1] > 0.7 and  # Higher volume requirement
-        price_strength > 0.4 and  # Higher strength threshold
-        df['c'].iloc[-1] > price_ma.iloc[-1] * 1.01):  # Must be clearly above MA
-        sign_scores[WyckoffSign.SIGN_OF_STRENGTH] = price_change.iloc[-1] * volume_change.iloc[-1]
-        
-    # Buying Climax (BC)
-    if (price_change.iloc[-1] > min_price_move * 2.0 and  # Increased from 1.8
-        volume_change.iloc[-1] > min_volume_surge * 1.2 and 
-        price_strength > STRONG_DEV_THRESHOLD * 0.9 and  # Higher strength
-        price_distance_from_ma > 0.05 and  # Further from MA
+
+    # Sign of Strength (SOS) - use 75th percentile for strong but not extreme moves
+    if (price_change.iloc[-1] > price_p75 and  # Top 25% price moves
+            confirm_trend(3, price_p75 * 0.6) and
+            (df['v'].iloc[-1] / volume_ma.iloc[-1]) > volume_p75 and  # Above average volume
+            price_strength > 0.4 and
+            df['c'].iloc[-1] > price_ma.iloc[-1] * 1.01):
+        # Score based on how far above the threshold
+        percentile_strength = price_change.iloc[-1] / price_p75
+        sign_scores[WyckoffSign.SIGN_OF_STRENGTH] = percentile_strength * (df['v'].iloc[-1] / volume_ma.iloc[-1])
+
+    # Buying Climax (BC) - mirror of SC, use 90th percentile
+    if (abs(price_change.iloc[-1]) > price_p90 and
+            price_change.iloc[-1] > 0 and
+            (df['v'].iloc[-1] / volume_ma.iloc[-1]) > volume_p90 and
+            price_strength > STRONG_DEV_THRESHOLD * 0.9 and
+            price_distance_from_ma > 0.05 and
         confirm_volume(3, min_volume_surge * 0.8)):
-        sign_scores[WyckoffSign.BUYING_CLIMAX] = price_change.iloc[-1] * volume_change.iloc[-1]
+        percentile_strength = price_change.iloc[-1] / price_p90
+        sign_scores[WyckoffSign.BUYING_CLIMAX] = percentile_strength * (df['v'].iloc[-1] / volume_ma.iloc[-1])
         
     # Upthrust (UT)
     if (is_upthrust and
@@ -186,13 +198,15 @@ def detect_wyckoff_signs(
         confirm_trend(3, min_price_move * 0.6, -1)):
         sign_scores[WyckoffSign.LAST_POINT_OF_RESISTANCE] = abs(price_change.iloc[-1]) * volume_trend
 
-    # Sign of Weakness (SOW)
-    if (price_change.iloc[-1] < -min_price_move * sos_multiplier * 1.2 and
-        confirm_trend(3, min_price_move * 0.8, -1) and
-        volume_change.iloc[-1] > 0.7 and  # Higher volume requirement
-        price_strength < -0.4 and  # Lower strength threshold
-        df['c'].iloc[-1] < price_ma.iloc[-1] * 0.99):  # Must be clearly below MA
-        sign_scores[WyckoffSign.SIGN_OF_WEAKNESS] = abs(price_change.iloc[-1]) * volume_change.iloc[-1]
+    # Sign of Weakness (SOW) - mirror of SOS
+    if (abs(price_change.iloc[-1]) > price_p75 and
+            price_change.iloc[-1] < 0 and
+            confirm_trend(3, price_p75 * 0.6, -1) and
+            (df['v'].iloc[-1] / volume_ma.iloc[-1]) > volume_p75 and
+            price_strength < -0.4 and
+            df['c'].iloc[-1] < price_ma.iloc[-1] * 0.99):
+        percentile_strength = abs(price_change.iloc[-1]) / price_p75
+        sign_scores[WyckoffSign.SIGN_OF_WEAKNESS] = percentile_strength * (df['v'].iloc[-1] / volume_ma.iloc[-1])
 
     # Return the strongest sign if it exists, otherwise NONE
     if sign_scores:

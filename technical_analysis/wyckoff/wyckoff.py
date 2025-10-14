@@ -102,62 +102,102 @@ def calculate_volume_metrics(df: pd.DataFrame, timeframe: Timeframe) -> VolumeMe
         )
 
 def detect_spring_upthrust(df: pd.DataFrame, timeframe: Timeframe, idx: int, vol_metrics: VolumeMetrics) -> tuple[bool, bool]:
-    """Enhanced spring/upthrust detection with improved validation and edge case handling."""
-    if idx < 4 or len(df) <= idx:  # Added upper bound check
+    """
+    Enhanced spring/upthrust detection following Wyckoff principles.
+
+    CRITICAL: Spring and Upthrust MUST have LOWER volume than the climax that preceded them.
+    This is what makes them valid tests - the lack of supply/demand at the extreme.
+
+    Spring: Test of support with declining volume (lack of selling pressure)
+    Upthrust: Test of resistance with declining volume (lack of buying pressure)
+    """
+    if idx < 4 or len(df) <= idx:
         return False, False
-    
+
     try:
-        # Use standard window for better reliability
-        window = df.iloc[max(0, idx-4):idx+1]  # Ensure we don't go below 0
-        
-        if len(window) < 3:  # Need minimum window size
+        # Extend window to find previous climax points
+        lookback = min(20, len(df) - 1)
+        extended_window = df.iloc[max(0, idx - lookback):idx + 1]
+        window = df.iloc[max(0, idx - 4):idx + 1]
+
+        if len(window) < 3 or len(extended_window) < 10:
             return False, False
-            
+
         low_point = window['l'].min()
         high_point = window['h'].max()
         close = window['c'].iloc[-1]
         current_low = window['l'].iloc[-1]
         current_high = window['h'].iloc[-1]
-        
+        current_volume = df['v'].iloc[-1]
+
         # Calculate volatility context
         price = df['c'].iloc[-1]
-        if price <= 0:  # Invalid price
+        if price <= 0:
             return False, False
-        
-        # Get adaptive thresholds based on market conditions
+
+        # Get adaptive thresholds
         thresholds = AdaptiveThresholdManager.get_spring_upthrust_thresholds(df, timeframe)
         spring_threshold = thresholds["spring"]
         upthrust_threshold = thresholds["upthrust"]
-        
+
         # Check for extremely large candle wicks to avoid false signals
         max_wick = thresholds.get("max_wick", 0.2)
         total_range = window['h'].max() - window['l'].min()
         if total_range > price * max_wick:
             return False, False
-            
-        # Volume must be significant for both patterns
-        if vol_metrics.strength <= 1.0:
-            return False, False
-        
-        # Spring detection - more precise conditions
-        spring_bounce = abs(close - current_low) if current_low < low_point else 0
-        is_spring = (
-            current_low < low_point and         # Makes new low
-            close > low_point and               # Closes above the low
-            spring_bounce > price * spring_threshold and  # Significant bounce
-            close > current_low * 1.005        # Closes meaningfully above the low
-        )
-        
-        # Upthrust detection - more precise conditions  
-        upthrust_rejection = abs(current_high - close) if current_high > high_point else 0
-        is_upthrust = (
-            current_high > high_point and       # Makes new high
-            close < high_point and              # Closes below the high
-            upthrust_rejection > price * upthrust_threshold and  # Significant rejection
-            close < current_high * 0.995       # Closes meaningfully below the high
-        )
-        
+
+        # === SPRING DETECTION ===
+        # Find recent lows and their volumes (potential selling climax)
+        recent_lows_mask = extended_window['l'] == extended_window['l'].rolling(5).min()
+        recent_low_volumes = extended_window.loc[recent_lows_mask, 'v']
+
+        # Require at least one previous low to compare volume
+        if len(recent_low_volumes) > 0:
+            avg_low_volume = recent_low_volumes.mean()
+
+            # Spring conditions (Wyckoff correct logic):
+            # 1. Makes new low (penetration)
+            # 2. Closes back above the low (rejection)
+            # 3. LOWER volume than previous lows (key!)
+            spring_bounce = abs(close - current_low) if current_low < low_point else 0
+
+            is_spring = (
+                    current_low < low_point and  # Penetrates support
+                    close > low_point and  # Closes back above
+                    spring_bounce > price * spring_threshold and  # Significant bounce
+                    close > current_low * 1.005 and  # Closes meaningfully above wick
+                    current_volume < avg_low_volume * 0.75  # LOWER volume (critical!)
+            )
+        else:
+            is_spring = False
+
+        # === UPTHRUST DETECTION ===
+        # Find recent highs and their volumes (potential buying climax)
+        recent_highs_mask = extended_window['h'] == extended_window['h'].rolling(5).max()
+        recent_high_volumes = extended_window.loc[recent_highs_mask, 'v']
+
+        # Require at least one previous high to compare volume
+        if len(recent_high_volumes) > 0:
+            avg_high_volume = recent_high_volumes.mean()
+
+            # Upthrust conditions (Wyckoff correct logic):
+            # 1. Makes new high (penetration)
+            # 2. Closes back below the high (rejection)
+            # 3. LOWER volume than previous highs (key!)
+            upthrust_rejection = abs(current_high - close) if current_high > high_point else 0
+
+            is_upthrust = (
+                    current_high > high_point and  # Penetrates resistance
+                    close < high_point and  # Closes back below
+                    upthrust_rejection > price * upthrust_threshold and  # Significant rejection
+                    close < current_high * 0.995 and  # Closes meaningfully below wick
+                    current_volume < avg_high_volume * 0.75  # LOWER volume (critical!)
+            )
+        else:
+            is_upthrust = False
+
         return is_spring, is_upthrust
+
     except Exception as e:
         logger.error(f"Error in spring/upthrust detection: {e}")
         return False, False
@@ -179,15 +219,11 @@ def detect_wyckoff_phase(df: pd.DataFrame, timeframe: Timeframe, funding_rates: 
         # Rest of function remains the same
         price_sma = df['c'].rolling(window=MIN_PERIODS).mean()
         price_std = df['c'].rolling(window=MIN_PERIODS).std()
-        
-        # Volume analysis (VSA)
-        effort_vs_result = pd.Series([0.0] * len(recent_df), index=recent_df.index)
-        price_range_mask = (recent_df['h'] - recent_df['l']) > 0
-        if price_range_mask.any():
-            effort_vs_result[price_range_mask] = (
-                (recent_df['c'] - recent_df['o']) / 
-                (recent_df['h'] - recent_df['l'])
-            )[price_range_mask]
+
+        # Volume Spread Analysis (VSA) - Wyckoff Effort vs Result
+        # Effort = Volume relative to average
+        # Result = Price movement efficiency
+        effort_vs_result = calculate_effort_vs_result_series(df, timeframe)
         
         # Get current values
         avg_price = price_sma.iloc[-1]
@@ -241,6 +277,7 @@ def detect_wyckoff_phase(df: pd.DataFrame, timeframe: Timeframe, funding_rates: 
         wyckoff_sign = detect_wyckoff_signs(df, price_strength, vol_metrics.trend_strength, is_spring, is_upthrust, timeframe)
 
         # Create WyckoffState instance
+        # Note: Bayesian fields will be populated by analyzer after detection
         wyckoff_state = WyckoffState(
             phase=current_phase,
             uncertain_phase=uncertain_phase,
@@ -253,11 +290,17 @@ def detect_wyckoff_phase(df: pd.DataFrame, timeframe: Timeframe, funding_rates: 
             composite_action=composite_action,
             wyckoff_sign=wyckoff_sign,
             funding_state=funding_state,
-            description=generate_wyckoff_description(
-                current_phase, uncertain_phase, vol_metrics.state, 
-                is_spring, is_upthrust, effort_result,
-                composite_action, wyckoff_sign, funding_state
-            )
+            description=""  # Will be set below after Bayesian detection
+        )
+
+        # Generate description with Bayesian info (will be updated by analyzer if needed)
+        wyckoff_state.description = generate_wyckoff_description(
+            current_phase, uncertain_phase, vol_metrics.state,
+            is_spring, is_upthrust, effort_result,
+            composite_action, wyckoff_sign, funding_state,
+            wyckoff_state.regime_change_detected,
+            wyckoff_state.regime_stability,
+            wyckoff_state.periods_in_current_regime
         )
 
         return wyckoff_state # type: ignore
@@ -441,95 +484,143 @@ def analyze_funding_rates(funding_rates: List[FundingRateEntry]) -> FundingState
     else:
         return FundingState.NEUTRAL
 
+
+def calculate_effort_vs_result_series(df: pd.DataFrame, timeframe: Timeframe, lookback: int = 5) -> pd.Series:
+    """
+    Calculate true VSA effort vs result ratio as a series.
+
+    Wyckoff/VSA principles:
+    - EFFORT = Volume (the cause)
+    - RESULT = Price movement (the effect)
+    - High effort + Low result = Absorption (accumulation/distribution)
+    - Low effort + High result = Professional money moving market
+
+    Returns:
+        Series where:
+        > 1.0 = Result exceeds effort (efficient, professional)
+        < 0.5 = Effort exceeds result (absorption, institutional)
+        ~1.0 = Balanced
+    """
+    try:
+        if len(df) < lookback + 20:
+            return pd.Series([0.0] * len(df), index=df.index)
+
+        # Calculate volume effort (normalized)
+        volume_ma = df['v'].rolling(window=20).mean()
+        volume_effort = df['v'] / volume_ma.replace(0, 1e-8)
+
+        # Calculate price result (movement efficiency)
+        price_move = (df['c'] - df['o']).abs()
+        range_size = (df['h'] - df['l']).replace(0, 1e-8)
+        price_result = price_move / range_size
+
+        # Effort vs Result ratio
+        # Higher ratio = more result per unit of effort (professional)
+        # Lower ratio = absorption (high volume, small move)
+        effort_vs_result_ratio = price_result / volume_effort.replace(0, 1e-8)
+
+        # Smooth to reduce noise
+        effort_vs_result_smooth = effort_vs_result_ratio.rolling(window=3).mean()
+
+        # Normalize to -1 to 1 range considering direction
+        direction = np.sign(df['c'] - df['o'])
+
+        # Final series: positive = bullish efficient, negative = bearish efficient
+        # Values near 0 = absorption
+        result_series = direction * effort_vs_result_smooth
+
+        return result_series.fillna(0.0)
+
+    except Exception as e:
+        logger.error(f"Error calculating effort vs result series: {e}")
+        return pd.Series([0.0] * len(df), index=df.index)
+
+
 def analyze_effort_result(
     df: pd.DataFrame,
     vol_metrics: VolumeMetrics,
     timeframe: Timeframe
 ) -> EffortResult:
     """
-    Balanced effort vs result analysis with improved validation and error handling.
+    True VSA effort vs result analysis using Wyckoff principles.
+
+    Uses the effort_vs_result series calculated earlier to determine
+    if current market action shows absorption or professional activity.
+
     Args:
         df: Price and volume data
         vol_metrics: Volume metrics from calculate_volume_metrics
         timeframe: Current timeframe for context
     """
     try:
-        # Get recent data - use timeframe settings
         lookback = timeframe.settings.effort_lookback
-        
-        if len(df) < lookback:
+
+        if len(df) < lookback + 20:
             return EffortResult.UNKNOWN
-            
-        recent_df = df.iloc[-lookback:]
-        
-        # Calculate normalized price movement with validation
-        price_change = abs(recent_df['c'].iloc[-1] - recent_df['o'].iloc[-1])
-        price_range = recent_df['h'].iloc[-1] - recent_df['l'].iloc[-1]
-        
-        # Validate price data
-        if price_range <= 0 or pd.isna(price_change):
+
+        # Calculate true VSA metrics
+        volume_ma = df['v'].rolling(window=20).mean().iloc[-1]
+        current_volume = df['v'].iloc[-1]
+        volume_effort = current_volume / max(volume_ma, 1e-8)
+
+        # Price result (efficiency of movement)
+        price_move = abs(df['c'].iloc[-1] - df['o'].iloc[-1])
+        range_size = df['h'].iloc[-1] - df['l'].iloc[-1]
+
+        if range_size <= 0:
             return EffortResult.UNKNOWN
-        
-        # Apply minimum move threshold
-        min_move = RESULT_MIN_MOVE * timeframe.settings.min_move_multiplier
-        
-        # Calculate volume quality with better validation
-        volume_consistency = max(0.0, min(1.0, vol_metrics.consistency))
-        
-        # Improved spread quality calculation
-        spread_ratio = (recent_df['h'] - recent_df['l'])
-        close_open_diff = abs(recent_df['c'] - recent_df['o'])
-        
-        # Avoid division by zero
-        valid_spreads = spread_ratio > 1e-8
-        if valid_spreads.sum() == 0:
-            return EffortResult.UNKNOWN
-            
-        spread_quality = 1.0 - (close_open_diff[valid_spreads] / spread_ratio[valid_spreads]).mean()
-        spread_quality = max(0.0, min(1.0, spread_quality))
-        
-        # Balanced volume quality calculation
-        volume_quality = (volume_consistency * 0.5 + spread_quality * 0.5)
-        
-        # Calculate price impact with improved validation
-        avg_price = recent_df['c'].mean()
-        if avg_price <= 0 or vol_metrics.ratio <= 0:
-            return EffortResult.UNKNOWN
-            
-        price_impact = price_change / (avg_price * max(vol_metrics.ratio, 0.1))
-        
-        # Calculate efficiency score with validation
-        base_efficiency = price_change / max(price_range, 1e-8)
-        volume_weighted_efficiency = base_efficiency * (1 + vol_metrics.strength * timeframe.settings.volume_weighted_efficiency)
-        
-        # Balanced thresholds from settings
-        high_threshold = HIGH_EFFICIENCY_THRESHOLD * timeframe.settings.high_threshold
-        low_threshold = LOW_EFFICIENCY_THRESHOLD * timeframe.settings.low_threshold
-        
-        # Final efficiency score
-        efficiency = min(1.0, max(0.0, volume_weighted_efficiency))
-        
-        # Calculate balanced volume factor
-        is_short_timeframe = timeframe in SHORT_TERM_TIMEFRAMES
-        volume_factor = vol_metrics.ratio / (EFFORT_VOLUME_THRESHOLD * 
-                         (0.9 if is_short_timeframe else 1.0))
-        
-        # Clear classification logic
-        if efficiency > high_threshold and volume_quality > 0.6:
+
+        price_result = price_move / range_size
+
+        # Calculate effort-result relationship
+        # High volume (effort) with low price movement (result) = WEAK (absorption)
+        # Low volume (effort) with high price movement (result) = STRONG (professional)
+
+        # STRONG conditions:
+        # 1. High efficiency (result/effort > 1.0) = Professional money
+        # 2. Low volume but strong directional move = Smart money
+        if volume_effort < 1.2 and price_result > 0.6:
+            # Low effort, high result = STRONG (professionals)
             return EffortResult.STRONG
-        elif efficiency < low_threshold and volume_quality < 0.4:
-            return EffortResult.WEAK
-        elif price_change < min_move * 0.5:
-            return EffortResult.WEAK
-        elif price_impact > 1.2 and volume_factor > 1.1:
+
+        if volume_effort > 0.8 and price_result > 0.7:
+            # Normal effort, very high result = STRONG
             return EffortResult.STRONG
-        elif price_impact < 0.4 and volume_factor < 0.7:
+
+        # WEAK conditions:
+        # 1. High volume but small move = Absorption (institutions accumulating/distributing)
+        # 2. High effort, low result = Supply/demand being absorbed
+        if volume_effort > 2.0 and price_result < 0.3:
+            # High effort, low result = WEAK (absorption)
             return EffortResult.WEAK
-        elif efficiency > 0.5:
+
+        if volume_effort > 1.5 and price_result < 0.4:
+            # Moderate-high effort, low result = WEAK
+            return EffortResult.WEAK
+
+        # Check for specific Wyckoff patterns
+        # No demand: low volume down move
+        if vol_metrics.state == VolumeState.LOW and df['c'].iloc[-1] < df['o'].iloc[-1]:
+            return EffortResult.WEAK
+
+        # No supply: low volume up move
+        if vol_metrics.state == VolumeState.LOW and df['c'].iloc[-1] > df['o'].iloc[-1]:
             return EffortResult.STRONG
+
+        # Default: analyze overall balance
+        effort_result_ratio = price_result / max(volume_effort, 0.1)
+
+        if effort_result_ratio > 0.8:
+            return EffortResult.STRONG
+        elif effort_result_ratio < 0.4:
+            return EffortResult.WEAK
         else:
-            return EffortResult.WEAK
-            
+            # Neutral zone - use volume state as tiebreaker
+            if vol_metrics.state in [VolumeState.VERY_HIGH, VolumeState.HIGH]:
+                return EffortResult.WEAK  # High volume without result = absorption
+            else:
+                return EffortResult.UNKNOWN
+
     except Exception as e:
         logger.error(f"Error in effort vs result analysis: {e}")
         return EffortResult.UNKNOWN

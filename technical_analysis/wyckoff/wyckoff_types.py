@@ -132,6 +132,11 @@ class WyckoffState:
     funding_state: FundingState
     description: str
     liquidity: MarketLiquidity = MarketLiquidity.UNKNOWN
+    # Bayesian change point detection
+    regime_change_detected: bool = False
+    regime_change_probability: float = 0.0
+    regime_stability: float = 0.5
+    periods_in_current_regime: int = 0
 
     def to_dict(self):
         return {
@@ -147,7 +152,11 @@ class WyckoffState:
             'wyckoff_sign': self.wyckoff_sign.value,
             'funding_state': self.funding_state.value,
             'description': self.description,
-            'liquidity': self.liquidity.value
+            'liquidity': self.liquidity.value,
+            'regime_change_detected': self.regime_change_detected,
+            'regime_change_probability': self.regime_change_probability,
+            'regime_stability': self.regime_stability,
+            'periods_in_current_regime': self.periods_in_current_regime
         }
 
     @staticmethod
@@ -165,7 +174,11 @@ class WyckoffState:
             wyckoff_sign=WyckoffSign.NONE,
             funding_state=FundingState.UNKNOWN,
             description="Unknown market state",
-            liquidity=MarketLiquidity.UNKNOWN
+            liquidity=MarketLiquidity.UNKNOWN,
+            regime_change_detected=False,
+            regime_change_probability=0.0,
+            regime_stability=0.5,
+            periods_in_current_regime=0
         )
 
 @dataclass

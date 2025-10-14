@@ -4,18 +4,21 @@ from .wyckoff_types import (
 )
 
 def generate_wyckoff_description(
-    phase: WyckoffPhase, 
-    uncertain_phase: bool, 
+        phase: WyckoffPhase,
+        uncertain_phase: bool,
     volume_state: VolumeState,
-    is_spring: bool, 
-    is_upthrust: bool, 
+        is_spring: bool,
+        is_upthrust: bool,
     effort_result: EffortResult,
-    composite_action: CompositeAction, 
+        composite_action: CompositeAction,
     wyckoff_sign: WyckoffSign,
-    funding_state: FundingState
+        funding_state: FundingState,
+        regime_change_detected: bool = False,
+        regime_stability: float = 0.5,
+        periods_in_regime: int = 0
 ) -> str:
-    """Generate a descriptive summary of the current Wyckoff state."""
-    
+    """Generate a descriptive summary of the current Wyckoff state with Bayesian insights."""
+
     if phase == WyckoffPhase.UNKNOWN:
         return "Insufficient data for Wyckoff analysis"
     
@@ -78,6 +81,14 @@ def generate_wyckoff_description(
     # Add funding rate info if available
     if funding_state not in [FundingState.NEUTRAL, FundingState.UNKNOWN]:
         components.append(f"Funding rates are {funding_state.value}")
-    
+
+    # Add Bayesian regime change detection info
+    if regime_change_detected:
+        components.append("⚠️ Regime change detected - potential phase transition")
+    elif regime_stability > 0.75 and periods_in_regime > 30:
+        components.append(f"✓ Stable regime ({periods_in_regime} periods)")
+    elif regime_stability < 0.3:
+        components.append(f"⚡ Unstable regime - watch for transition")
+
     # Combine all components
     return "\n".join(components)
