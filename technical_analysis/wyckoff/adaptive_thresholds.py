@@ -6,7 +6,87 @@ from .wyckoff_types import Timeframe
 
 class AdaptiveThresholdManager:
     """Manages dynamic thresholds for Wyckoff analysis based on market conditions"""
-    
+
+    @staticmethod
+    def get_wyckoff_sign_thresholds(df: pd.DataFrame, timeframe: Timeframe) -> Dict[str, float]:
+        """
+        Calculate adaptive thresholds for Wyckoff sign detection using percentiles.
+        Uses rolling historical data to determine what constitutes 'significant' moves
+        rather than relying on fixed multipliers.
+        """
+        if df.empty or len(df) < 30:
+            # Fallback to conservative defaults
+            return {
+                "min_price_move": 0.008,
+                "min_volume_surge": 2.0,
+                "price_percentile_75": 0.015,
+                "price_percentile_90": 0.025,
+                "volume_percentile_75": 1.5,
+                "volume_percentile_90": 2.5
+            }
+
+        try:
+            # Use appropriate lookback based on timeframe
+            lookback = min(len(df), timeframe.settings.wyckoff_trend_lookback * 5)
+            recent_df = df.iloc[-lookback:]
+
+            # Calculate price changes
+            price_changes = recent_df['c'].pct_change().abs().dropna()
+            volume_changes = (recent_df['v'] / recent_df['v'].rolling(
+                timeframe.settings.volume_ma_window
+            ).mean()).dropna()
+
+            # Remove outliers using IQR method (keep 1.5*IQR range)
+            def remove_outliers(series: pd.Series) -> pd.Series:
+                q1, q3 = series.quantile([0.25, 0.75])
+                iqr = q3 - q1
+                lower_bound = q1 - 1.5 * iqr
+                upper_bound = q3 + 1.5 * iqr
+                return series[(series >= lower_bound) & (series <= upper_bound)]
+
+            clean_price_changes = remove_outliers(price_changes)
+            clean_volume_changes = remove_outliers(volume_changes)
+
+            # Calculate percentile-based thresholds
+            price_p75 = clean_price_changes.quantile(0.75)
+            price_p90 = clean_price_changes.quantile(0.90)
+            volume_p75 = clean_volume_changes.quantile(0.75)
+            volume_p90 = clean_volume_changes.quantile(0.90)
+
+            # Apply timeframe-specific volatility factor
+            volatility_factor = timeframe.settings.wyckoff_volatility_factor
+
+            # Minimum thresholds: use median as baseline (more robust than mean)
+            min_price_move = max(
+                clean_price_changes.median() * 1.5,
+                0.002  # Absolute minimum for crypto
+            ) * volatility_factor
+
+            min_volume_surge = max(
+                clean_volume_changes.median() * 1.2,
+                1.3  # Absolute minimum
+            ) * volatility_factor
+
+            return {
+                "min_price_move": min_price_move,
+                "min_volume_surge": min_volume_surge,
+                "price_percentile_75": price_p75 * volatility_factor,
+                "price_percentile_90": price_p90 * volatility_factor,
+                "volume_percentile_75": volume_p75 * volatility_factor,
+                "volume_percentile_90": volume_p90 * volatility_factor
+            }
+
+        except Exception as e:
+            logger.warning(f"Error calculating Wyckoff sign thresholds: {e}")
+            return {
+                "min_price_move": 0.008,
+                "min_volume_surge": 2.0,
+                "price_percentile_75": 0.015,
+                "price_percentile_90": 0.025,
+                "volume_percentile_75": 1.5,
+                "volume_percentile_90": 2.5
+            }
+
     @staticmethod
     def get_spring_upthrust_thresholds(df: pd.DataFrame, timeframe: Timeframe) -> Dict[str, float]:
         """Calculate dynamic thresholds for spring/upthrust detection"""
